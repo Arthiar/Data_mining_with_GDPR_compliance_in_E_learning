@@ -14,8 +14,9 @@ __pycache__/
 dist/
 build/
 
-# Generated outputs
-output/
+# Runtime logs and temporary exports
+output/logs/
+output/exports/
 exports/
 
 # OS and editor files
