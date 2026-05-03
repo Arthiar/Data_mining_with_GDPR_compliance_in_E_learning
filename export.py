@@ -1,712 +1,603 @@
-# export.py — export Moodle course data (quizzes, assignments, H5P, database, forums),
-# anonymise users, write CSVs, and reset ./output on every run.
+# export.py
+# Connects to Moodle via the REST API, downloads course activity data,
+# replaces all user IDs with anonymised codes for privacy, and saves
+# the results as CSV files in the output/exports/ folder.
 #
-# Usage:
-#   1) Create .env (see values below)
-#   2) pip install -r requirements.txt
-#   3) python export.py
-#
-# .env keys (example):
-#   MOODLE_BASE_URL=https://moodle-dev.go-study-europe.de
-#   MOODLE_WSTOKEN=YOUR_TOKEN_HERE
-#   COURSE_ID=1516
-#   QUIZ_CMIDS=2641,2672,2657
-#   ASSIGN_CMIDS=2652,2659,2660,2664,2665,2667,2673
-#   FORUM_CMIDS=
-#   HVP_CMIDS=2649,2650
-#   DATA_CMIDS=2653
-#   HASH_SALT=any_long_random_string
+# How to run:
+#   1. Copy .env.example to .env and fill in your Moodle details
+#   2. pip install -r requirements.txt
+#   3. python export.py
 
-import os, sys, time, shutil, hashlib
+import os
+import sys
+import time
+import shutil
+import hashlib
 from pathlib import Path
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 
 import requests
 import pandas as pd
 from dotenv import load_dotenv
 from tqdm import tqdm
 
-# ----------------- Paths & simple logger -----------------
+# Load settings from the .env file
+load_dotenv()
 
-ROOT = Path(__file__).parent.resolve()
-OUT = ROOT / "output"
+MOODLE_URL = os.getenv("MOODLE_BASE_URL", "").rstrip("/")
+TOKEN      = os.getenv("MOODLE_WSTOKEN", "")
+SALT       = os.getenv("HASH_SALT", "default_salt")
+COURSE_ID  = int(os.getenv("COURSE_ID", "0"))
+API_URL    = MOODLE_URL + "/webservice/rest/server.php"
+
+# Output folder paths
+ROOT    = Path(__file__).parent
+OUT     = ROOT / "output"
 EXPORTS = OUT / "exports"
-LOGS = OUT / "logs"
+LOGS    = OUT / "logs"
 
-def log(msg: str):
-    """Console + file log with timestamp."""
-    stamp = datetime.now().isoformat(timespec="seconds")
-    line = f"[{stamp}] {msg}"
-    print(line, flush=True)
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+
+def log(message):
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"[{timestamp}] {message}"
+    print(line)
     LOGS.mkdir(parents=True, exist_ok=True)
     with open(LOGS / "run.log", "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
-def reset_output():
-    """Delete and recreate output/ tree so each run is fresh."""
-    if OUT.exists():
-        shutil.rmtree(OUT, ignore_errors=True)
-    EXPORTS.mkdir(parents=True, exist_ok=True)
-    LOGS.mkdir(parents=True, exist_ok=True)
 
-def write_csv(df: pd.DataFrame, path: Path):
-    EXPORTS.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False, encoding="utf-8-sig")
+# ── Utility functions ─────────────────────────────────────────────────────────
 
-# ----------------- Helpers -----------------
-
-def parse_ids(s: Optional[str]) -> List[int]:
-    if not s:
-        return []
-    return [int(x.strip()) for x in s.split(",") if x.strip().isdigit()]
-
-def to_iso(ts: Optional[int]) -> Optional[str]:
-    if not ts or int(ts) == 0:
+def anonymise(user_id):
+    """Replace a real user ID with a consistent hashed code (SHA-256)."""
+    if user_id is None:
         return None
-    return datetime.fromtimestamp(int(ts)).isoformat(sep=" ", timespec="seconds")
+    hashed = hashlib.sha256((SALT + str(user_id)).encode()).hexdigest()
+    return "u_" + hashed[:12]
 
-def duration_secs(start: Optional[int], finish: Optional[int]) -> Optional[int]:
+
+def to_datetime_str(timestamp):
+    """Convert a Unix timestamp to a readable date string."""
+    if not timestamp or int(timestamp) == 0:
+        return None
+    return datetime.fromtimestamp(int(timestamp)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def calc_duration(start, finish):
+    """Return the number of seconds between two Unix timestamps."""
     try:
-        if not start or not finish:
-            return None
         return int(finish) - int(start)
     except Exception:
         return None
 
-def pct(a: Optional[float], b: Optional[float]) -> Optional[float]:
-    try:
-        if a is None or b in (None, 0, 0.0):
-            return None
-        return float(a) / float(b) * 100.0
-    except Exception:
-        return None
 
-def anon_user(userid: Optional[int], salt: str) -> Optional[str]:
-    if userid is None:
-        return None
-    h = hashlib.sha256((salt + str(userid)).encode("utf-8")).hexdigest()
-    return f"u_{h[:12]}"
+def parse_cmids(value):
+    """Parse a comma-separated string of IDs from the .env file."""
+    if not value:
+        return []
+    return [int(x.strip()) for x in value.split(",") if x.strip().isdigit()]
 
-# ----------------- REST API client with retries -----------------
 
-# ----------------- REST API client with retries + array flatten -----------------
+# ── Moodle API ────────────────────────────────────────────────────────────────
 
-class API:
-    """Thin Moodle REST client with robust retries, clear errors, and correct array encoding."""
-    RETRY_STATUSES = {429, 500, 502, 503, 504}
+def call_moodle(function_name, **params):
+    """Send a request to the Moodle REST API and return the response as a Python object."""
 
-    def __init__(self, base: str, token: str):
-        self.base = base.rstrip("/")
-        self.token = token
-        self.endpoint = f"{self.base}/webservice/rest/server.php"
-        self.headers = {"User-Agent": "Course1516-Exporter/1.0"}
+    # Build the base payload
+    payload = {
+        "wstoken":             TOKEN,
+        "wsfunction":          function_name,
+        "moodlewsrestformat":  "json",
+    }
 
-    def _flatten_params(self, params: dict) -> dict:
-        """
-        Moodle expects arrays/dicts as:
-          key[0]=..., key[1]=...
-          key[sub]=...
-        This flattens nested lists/dicts into that format.
-        """
-        flat = {}
+    # Moodle expects list parameters as key[0]=val, key[1]=val, etc.
+    for key, value in params.items():
+        if isinstance(value, list):
+            for i, item in enumerate(value):
+                payload[f"{key}[{i}]"] = item
+        else:
+            payload[key] = value
 
-        def _walk(prefix, value):
-            if isinstance(value, (list, tuple)):
-                for i, v in enumerate(value):
-                    _walk(f"{prefix}[{i}]", v)
-            elif isinstance(value, dict):
-                for k, v in value.items():
-                    _walk(f"{prefix}[{k}]", v)
-            else:
-                flat[prefix] = value
+    # Try up to 3 times in case of a temporary network issue
+    for attempt in range(1, 4):
+        try:
+            response = requests.post(API_URL, data=payload, timeout=60)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and data.get("exception"):
+                raise RuntimeError(f"Moodle API error: {data.get('message', str(data))}")
+            return data
+        except Exception as e:
+            if attempt == 3:
+                raise
+            log(f"Request failed (attempt {attempt}): {e}. Retrying in 3 seconds...")
+            time.sleep(3)
 
-        for k, v in params.items():
-            _walk(k, v)
-        return flat
 
-    def call(self, fn: str, **params):
-        # base payload
-        base_payload = {
-            "wstoken": self.token,
-            "wsfunction": fn,
-            "moodlewsrestformat": "json",
-        }
-        # flatten any arrays/dicts (e.g., courseids=[1516] → courseids[0]=1516)
-        payload = {**base_payload, **self._flatten_params(params)}
+# ── Setup ─────────────────────────────────────────────────────────────────────
 
-        backoff = 2  # seconds
-        last_error = None
-        for attempt in range(1, 6):
-            try:
-                resp = requests.post(self.endpoint, data=payload, headers=self.headers, timeout=60)
-                if resp.status_code in self.RETRY_STATUSES:
-                    last_error = f"{resp.status_code} {resp.reason}"
-                    log(f"[api] {fn} → transient {last_error} (attempt {attempt}); retrying after {backoff}s")
-                    time.sleep(backoff)
-                    backoff = min(backoff * 2, 30)
-                    continue
+def reset_output():
+    """Delete and recreate the output folder so each run starts fresh."""
+    if OUT.exists():
+        shutil.rmtree(OUT)
+    EXPORTS.mkdir(parents=True, exist_ok=True)
+    LOGS.mkdir(parents=True, exist_ok=True)
 
-                resp.raise_for_status()
-                try:
-                    data = resp.json()
-                except Exception:
-                    snippet = (resp.text or "")[:300].replace("\n", " ")
-                    raise RuntimeError(f"{fn} returned non-JSON (status {resp.status_code}): {snippet}")
 
-                if isinstance(data, dict) and data.get("exception"):
-                    raise RuntimeError(f"{fn} error: {data}")
-
-                return data
-
-            except requests.RequestException as e:
-                last_error = str(e)
-                log(f"[api] {fn} → network error '{last_error}' (attempt {attempt}); retrying after {backoff}s")
-                time.sleep(backoff)
-                backoff = min(backoff * 2, 30)
-
-        raise RuntimeError(f"{fn} failed after retries: {last_error}")
-
-# ----------------- Discovery -----------------
-
-def discover_modules(api: API, course_id: int) -> Dict[int, Dict[str, Any]]:
-    """Return {cmid: {'modname','instance','name'}} using core_course_get_contents."""
-    modules: Dict[int, Dict[str, Any]] = {}
-    sections = api.call("core_course_get_contents", courseid=course_id)
-    for sec in sections:
-        for m in sec.get("modules", []):
-            cmid = m.get("id")
+def get_modules():
+    """Return a dictionary of {cmid: {modname, instance, name}} for every module in the course."""
+    modules = {}
+    sections = call_moodle("core_course_get_contents", courseid=COURSE_ID)
+    for section in sections:
+        for mod in section.get("modules", []):
+            cmid = mod.get("id")
             if cmid:
                 modules[int(cmid)] = {
-                    "modname": m.get("modname"),
-                    "instance": m.get("instance"),
-                    "name": m.get("name"),
+                    "modname":  mod.get("modname"),
+                    "instance": mod.get("instance"),
+                    "name":     mod.get("name"),
                 }
     return modules
 
-def get_enrolled_user_ids(api: API, course_id: int) -> List[int]:
-    users = api.call("core_enrol_get_enrolled_users", courseid=course_id)
+
+def get_enrolled_users():
+    """Return a list of user IDs enrolled in the course."""
+    users = call_moodle("core_enrol_get_enrolled_users", courseid=COURSE_ID)
     return [int(u["id"]) for u in users]
 
-# ----------------- Exporters -----------------
 
-def export_quizzes(api: API, course_id: int, cmids: List[int], cmmap: Dict[int, Dict[str, Any]], salt: str):
+# ── Export functions ──────────────────────────────────────────────────────────
+
+def export_quizzes(cmids, modules):
     if not cmids:
-        log("[quiz] None configured — skipping.")
+        log("[quiz] No quiz CMIDs configured — skipping.")
         return
 
-    # Robust fetch: some Moodles return {"quizzes":[...]}, others return a plain list
-    resp = api.call("mod_quiz_get_quizzes_by_courses", courseids=[course_id])
-    if isinstance(resp, dict):
-        quizzes = resp.get("quizzes", []) or []
-    elif isinstance(resp, list):
-        quizzes = resp
+    # Fetch quiz configuration (names, max scores, time limits, etc.)
+    quiz_data = call_moodle("mod_quiz_get_quizzes_by_courses", courseids=[COURSE_ID])
+    if isinstance(quiz_data, dict):
+        quiz_list = quiz_data.get("quizzes", [])
     else:
-        quizzes = []
+        quiz_list = quiz_data or []
 
-    # quizid -> quiz config (sumgrades, grade, timeopen, timeclose, timelimit, attempts, name, ...)
-    qcfg: Dict[int, Dict[str, Any]] = {}
-    for q in quizzes:
+    # Build a lookup table: quiz_id -> config
+    quiz_config = {}
+    for q in quiz_list:
         try:
-            qcfg[int(q.get("id"))] = q
+            quiz_config[int(q["id"])] = q
         except Exception:
             continue
 
-    enrolled = get_enrolled_user_ids(api, course_id)
+    enrolled_users = get_enrolled_users()
 
     for cmid in cmids:
-        meta = cmmap.get(cmid, {})
-        if meta.get("modname") != "quiz":
-            log(f"[quiz] CMID {cmid} is not a quiz (found {meta.get('modname')}); skipping")
+        mod = modules.get(cmid, {})
+        if mod.get("modname") != "quiz":
+            log(f"[quiz] CMID {cmid} is not a quiz — skipping.")
             continue
 
-        quizid = int(meta.get("instance"))
-        qc = qcfg.get(quizid, {})  # may be empty if API didn’t return it
-        qname = qc.get("name") or meta.get("name")
+        quiz_id   = int(mod["instance"])
+        config    = quiz_config.get(quiz_id, {})
+        name      = config.get("name") or mod.get("name")
+        max_score = config.get("sumgrades")
+        max_grade = config.get("grade")
 
-        rows: List[Dict[str, Any]] = []
-        log(f"[quiz] Exporting '{qname}' (quizid={quizid}, cmid={cmid})")
+        log(f"[quiz] Exporting '{name}' (quizid={quiz_id}, cmid={cmid})")
+        rows = []
 
-        for uid in tqdm(enrolled, desc=f"quiz {quizid} users"):
-            # attempts may be a list OR a dict with {"attempts":[...]}
+        for user_id in tqdm(enrolled_users, desc=f"quiz {quiz_id}"):
             try:
-                attempts = api.call("mod_quiz_get_user_attempts", quizid=quizid, userid=uid, status="all")
-                if isinstance(attempts, dict) and "attempts" in attempts:
-                    attempts = attempts["attempts"]
+                result   = call_moodle("mod_quiz_get_user_attempts", quizid=quiz_id, userid=user_id, status="all")
+                attempts = result.get("attempts", []) if isinstance(result, dict) else result or []
             except Exception as e:
-                log(f"   ! attempts failed for user {uid}: {e}")
+                log(f"  Could not get attempts for user {user_id}: {e}")
                 continue
 
-            for a in attempts or []:
-                started = a.get("timestart") or a.get("timeStart")
-                finished = a.get("timefinish") or a.get("timeFinish")
-                dur_s = duration_secs(started, finished)
-                dur_m = (dur_s / 60.0) if dur_s is not None else None
+            for attempt in attempts:
+                start      = attempt.get("timestart")
+                finish     = attempt.get("timefinish")
+                duration_s = calc_duration(start, finish)
+                raw_score  = attempt.get("sumgrades")
 
-                raw_max    = qc.get("sumgrades")
-                scaled_max = qc.get("grade")
-                raw_score  = a.get("sumgrades")
-                score_pct  = pct(raw_score, raw_max)
+                # Work out the percentage score
+                if raw_score is not None and max_score:
+                    score_pct = round(float(raw_score) / float(max_score) * 100, 3)
+                else:
+                    score_pct = None
 
-                if (raw_score is not None and raw_max not in (None, 0) and scaled_max):
-                    try:
-                        scaled_grade = float(raw_score) / float(raw_max) * float(scaled_max)
-                    except Exception:
-                        scaled_grade = None
+                # Work out the scaled grade
+                if raw_score is not None and max_score and max_grade:
+                    scaled_grade = round(float(raw_score) / float(max_score) * float(max_grade), 3)
                 else:
                     scaled_grade = None
 
                 rows.append({
-                    "course_id": course_id,
-                    "cmid": cmid,
-                    "quizid": quizid,
-                    "quiz_name": qname,
-                    "anon_user": anon_user(uid, salt),
-                    "attemptid": a.get("id"),
-                    "attempt_no": a.get("attempt"),
-                    "state": a.get("state"),
-                    "timestart": to_iso(started),
-                    "timefinish": to_iso(finished),
-                    "started_unix": started,
-                    "finished_unix": finished,
-                    "duration_seconds": dur_s,
-                    "duration_minutes": round(dur_m, 3) if dur_m is not None else None,
-                    "raw_score": raw_score,
-                    "raw_max": raw_max,
-                    "scaled_max": scaled_max,
-                    "score_pct": round(score_pct, 3) if score_pct is not None else None,
-                    "scaled_grade": round(scaled_grade, 3) if scaled_grade is not None else None,
-                    "timeopen": qc.get("timeopen"),
-                    "timeclose": qc.get("timeclose"),
-                    "timelimit_seconds": qc.get("timelimit"),
-                    "attempts_allowed": qc.get("attempts"),
+                    "course_id":         COURSE_ID,
+                    "cmid":              cmid,
+                    "quizid":            quiz_id,
+                    "quiz_name":         name,
+                    "anon_user":         anonymise(user_id),
+                    "attemptid":         attempt.get("id"),
+                    "attempt_no":        attempt.get("attempt"),
+                    "state":             attempt.get("state"),
+                    "timestart":         to_datetime_str(start),
+                    "timefinish":        to_datetime_str(finish),
+                    "started_unix":      start,
+                    "finished_unix":     finish,
+                    "duration_seconds":  duration_s,
+                    "duration_minutes":  round(duration_s / 60, 3) if duration_s else None,
+                    "raw_score":         raw_score,
+                    "raw_max":           max_score,
+                    "scaled_max":        max_grade,
+                    "score_pct":         score_pct,
+                    "scaled_grade":      scaled_grade,
+                    "timeopen":          config.get("timeopen"),
+                    "timeclose":         config.get("timeclose"),
+                    "timelimit_seconds": config.get("timelimit"),
+                    "attempts_allowed":  config.get("attempts"),
                 })
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            fp = EXPORTS / f"quiz_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[quiz] Wrote {len(df)} rows → {fp.name}")
+            path = EXPORTS / f"quiz_{cmid}.csv"
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            log(f"[quiz] Wrote {len(df)} rows -> {path.name}")
         else:
             log(f"[quiz] No rows for cmid {cmid}.")
 
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            fp = EXPORTS / f"quiz_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[quiz] Wrote {len(df)} rows → {fp.name}")
-        else:
-            log(f"[quiz] No rows for cmid {cmid}.")
 
-def export_assignments(api: API, course_id: int, cmids: List[int], cmmap: Dict[int, Dict[str, Any]], salt: str):
+def export_assignments(cmids, modules):
     if not cmids:
-        log("[assign] None configured — skipping.")
+        log("[assign] No assignment CMIDs configured — skipping.")
         return
-    assigns_raw = api.call("mod_assign_get_assignments", courseids=[course_id])
-    assigns = {}
-    for c in assigns_raw.get("courses", []):
-        for a in c.get("assignments", []):
-            assigns[int(a["id"])] = a
-    # grades map
-    graw = api.call("mod_assign_get_grades", assignmentids=list(assigns.keys()) or [])
-    grades_map = {}
-    for g in graw.get("assignments", []):
-        aid = int(g["assignmentid"])
-        for gr in g.get("grades", []):
-            try:
-                grades_map[(aid, int(gr["userid"]))] = gr.get("grade")
-            except Exception:
-                pass
+
+    # Fetch all assignments for this course
+    result      = call_moodle("mod_assign_get_assignments", courseids=[COURSE_ID])
+    assignments = {}
+    for course in result.get("courses", []):
+        for a in course.get("assignments", []):
+            assignments[int(a["id"])] = a
+
+    # Fetch grades for all assignments
+    grades = {}
+    if assignments:
+        grade_result = call_moodle("mod_assign_get_grades", assignmentids=list(assignments.keys()))
+        for ag in grade_result.get("assignments", []):
+            aid = int(ag["assignmentid"])
+            for g in ag.get("grades", []):
+                try:
+                    grades[(aid, int(g["userid"]))] = g.get("grade")
+                except Exception:
+                    pass
 
     for cmid in cmids:
-        meta = cmmap.get(cmid, {})
-        if meta.get("modname") != "assign":
-            log(f"[assign] CMID {cmid} is not an assignment (found {meta.get('modname')}); skipping")
+        mod = modules.get(cmid, {})
+        if mod.get("modname") != "assign":
+            log(f"[assign] CMID {cmid} is not an assignment — skipping.")
             continue
-        aid = int(meta["instance"])
-        cfg = assigns.get(aid, {})
-        open_ts, due_ts, cut_ts = cfg.get("allowsubmissionsfromdate"), cfg.get("duedate"), cfg.get("cutoffdate")
 
-        subs_all = api.call("mod_assign_get_submissions", assignmentids=[aid])
-        rows = []
-        for a in subs_all.get("assignments", []):
+        assign_id = int(mod["instance"])
+        config    = assignments.get(assign_id, {})
+        name      = mod.get("name")
+        open_date = config.get("allowsubmissionsfromdate")
+        due_date  = config.get("duedate")
+        cutoff    = config.get("cutoffdate")
+
+        result = call_moodle("mod_assign_get_submissions", assignmentids=[assign_id])
+        rows   = []
+
+        for a in result.get("assignments", []):
             for sub in a.get("submissions", []):
                 try:
                     uid = int(sub["userid"])
                 except Exception:
                     uid = None
-                submitted = sub.get("timemodified") or sub.get("timecreated")
-                tts = (int(submitted) - int(open_ts)) if (submitted and open_ts) else None
+
+                submitted      = sub.get("timemodified") or sub.get("timecreated")
+                time_to_submit = None
+                if submitted and open_date:
+                    time_to_submit = int(submitted) - int(open_date)
+
                 rows.append({
-                    "course_id": course_id, "cmid": cmid,
-                    "assignid": aid, "assign_name": meta.get("name"),
-                    "anon_user": anon_user(uid, salt) if uid is not None else None,
-                    "submissionid": sub.get("id"),
-                    "status": sub.get("status"),
-                    "submitted_unix": submitted,
-                    "submitted_at": to_iso(submitted),
-                    "allowsubmissionsfromdate": open_ts,
-                    "duedate": due_ts, "cutoffdate": cut_ts,
-                    "time_to_submit_seconds": tts,
-                    "time_to_submit_hours": round(tts/3600.0, 3) if tts is not None else None,
-                    "grade": grades_map.get((aid, uid)) if uid is not None else None
+                    "course_id":                COURSE_ID,
+                    "cmid":                     cmid,
+                    "assignid":                 assign_id,
+                    "assign_name":              name,
+                    "anon_user":                anonymise(uid),
+                    "submissionid":             sub.get("id"),
+                    "status":                   sub.get("status"),
+                    "submitted_unix":            submitted,
+                    "submitted_at":             to_datetime_str(submitted),
+                    "allowsubmissionsfromdate": open_date,
+                    "duedate":                  due_date,
+                    "cutoffdate":               cutoff,
+                    "time_to_submit_seconds":   time_to_submit,
+                    "time_to_submit_hours":     round(time_to_submit / 3600, 3) if time_to_submit else None,
+                    "grade":                    grades.get((assign_id, uid)) if uid else None,
                 })
+
         df = pd.DataFrame(rows)
         if not df.empty:
-            fp = EXPORTS / f"assign_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[assign] Wrote {len(df)} rows → {fp.name}")
+            path = EXPORTS / f"assign_{cmid}.csv"
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            log(f"[assign] Wrote {len(df)} rows -> {path.name}")
         else:
             log(f"[assign] No rows for cmid {cmid}.")
 
-def export_h5p(api: API, course_id: int, cmids: List[int], cmmap: Dict[int, Dict[str, Any]], salt: str):
+
+def export_h5p(cmids, modules):
     if not cmids:
-        log("[h5p] None configured — skipping.")
+        log("[h5p] No H5P CMIDs configured — skipping.")
         return
 
-    # Separate requested CMIDs by module type
-    h5p_cmids_only = [c for c in cmids if cmmap.get(c, {}).get("modname") == "h5pactivity"]
-    hvp_cmids      = [c for c in cmids if cmmap.get(c, {}).get("modname") == "hvp"]
+    # Separate modern H5P activities from the legacy HVP plugin
+    h5p_cmids = [c for c in cmids if modules.get(c, {}).get("modname") == "h5pactivity"]
+    hvp_cmids = [c for c in cmids if modules.get(c, {}).get("modname") == "hvp"]
 
     if hvp_cmids:
-        # Old plugin “mod_hvp” (H5P by Joubel) usually doesn’t expose the same WS for attempts/results.
-        log(f"[h5p] Skipping legacy 'mod_hvp' CMIDs (not supported by mod_h5pactivity web services): {hvp_cmids}")
+        log(f"[h5p] Skipping legacy 'mod_hvp' CMIDs (not supported): {hvp_cmids}")
 
-    if not h5p_cmids_only:
+    if not h5p_cmids:
         log("[h5p] No 'H5P activity' (mod_h5pactivity) CMIDs to export — skipping.")
         return
 
-    # Map instance id -> cmid for the *h5pactivity* modules only
-    inst2cm = {}
-    for cmid in h5p_cmids_only:
-        meta = cmmap.get(cmid, {})
-        inst = meta.get("instance")
-        if inst is not None:
-            inst2cm[int(inst)] = cmid
+    # Map instance ID -> CMID for the H5P modules we care about
+    instance_to_cmid = {}
+    for cmid in h5p_cmids:
+        instance = modules[cmid].get("instance")
+        if instance:
+            instance_to_cmid[int(instance)] = cmid
 
-    # Get activities (handle dict or list)
     try:
-        resp = api.call("mod_h5pactivity_get_h5pactivities_by_courses", courseids=[course_id])
+        result     = call_moodle("mod_h5pactivity_get_h5pactivities_by_courses", courseids=[COURSE_ID])
+        activities = result.get("h5pactivities", []) if isinstance(result, dict) else result or []
     except Exception as e:
         log(f"[h5p] H5P endpoints not available: {e}")
         return
 
-    if isinstance(resp, dict):
-        activities = resp.get("h5pactivities") or resp.get("activities") or []
-    elif isinstance(resp, list):
-        activities = resp
-    else:
-        activities = []
-
-    for h in activities:
+    for activity in activities:
         try:
-            hid = int(h.get("id"))
+            h5p_id = int(activity["id"])
         except Exception:
             continue
 
-        cmid = inst2cm.get(hid)
+        cmid = instance_to_cmid.get(h5p_id)
         if not cmid:
-            # This H5P activity isn’t in the requested CMID list
             continue
 
-        hname = h.get("name")
-        log(f"[h5p] Exporting '{hname}' (h5pactivityid={hid}, cmid={cmid})")
+        name = activity.get("name")
+        log(f"[h5p] Exporting '{name}' (h5pactivityid={h5p_id}, cmid={cmid})")
 
-        # Attempts (shape-proof)
-        attempts_resp = {}
-        attempts = []
+        # Get attempt records
         try:
-            attempts_resp = api.call("mod_h5pactivity_get_user_attempts", h5pactivityid=hid)
-            if isinstance(attempts_resp, dict) and "attempts" in attempts_resp:
-                attempts = attempts_resp["attempts"] or []
-            elif isinstance(attempts_resp, list):
-                attempts = attempts_resp
-            else:
-                attempts = []
+            att_result = call_moodle("mod_h5pactivity_get_user_attempts", h5pactivityid=h5p_id)
+            attempts   = att_result.get("attempts", []) if isinstance(att_result, dict) else att_result or []
         except Exception as e:
-            log(f"   ! attempts fetch failed: {e}")
+            log(f"  Could not get attempts: {e}")
             attempts = []
 
-        # Results (shape-proof)
-        results = []
+        # Get score results
         try:
-            res = api.call("mod_h5pactivity_get_results", h5pactivityid=hid)
-            if isinstance(res, dict) and "results" in res:
-                results = res["results"] or []
-            elif isinstance(res, list):
-                results = res
-            else:
-                results = []
+            res_result   = call_moodle("mod_h5pactivity_get_results", h5pactivityid=h5p_id)
+            results_list = res_result.get("results", []) if isinstance(res_result, dict) else res_result or []
         except Exception:
-            results = []
+            results_list = []
 
-        # Map attemptid -> result
-        rmap = {}
-        for r in results:
-            rid = r.get("attemptid") or r.get("id")
-            rmap[rid] = r
+        results_by_id = {r.get("attemptid") or r.get("id"): r for r in results_list}
 
-        # Build rows
-        from math import isfinite
         rows = []
-        for a in attempts:
-            uid      = a.get("userid")
-            started  = a.get("timecreated") or a.get("timestarted")
-            finished = a.get("timemodified") or a.get("timefinished")
-            rid      = a.get("id")
-            rr       = rmap.get(rid, {}) if rid is not None else {}
+        for att in attempts:
+            uid     = att.get("userid")
+            start   = att.get("timecreated") or att.get("timestarted")
+            finish  = att.get("timemodified") or att.get("timefinished")
+            att_id  = att.get("id")
+            res     = results_by_id.get(att_id, {})
+            score   = res.get("score")
+            max_sc  = res.get("maxscore")
 
-            score    = rr.get("score")
-            maxscore = rr.get("maxscore")
+            score_pct = round(score / max_sc * 100, 3) if score is not None and max_sc else None
 
             rows.append({
-                "course_id": course_id,
-                "cmid": cmid,
-                "h5pactivityid": hid,
-                "h5p_name": hname,
-                "anon_user": anon_user(uid, salt) if uid is not None else None,
-                "attemptid": rid,
-                "timestart": to_iso(started),
-                "timefinish": to_iso(finished),
-                "started_unix": started,
-                "finished_unix": finished,
-                "duration_seconds": duration_secs(started, finished),
-                "score": score,
-                "maxscore": maxscore,
-                "score_pct": pct(score, maxscore) if (score is not None and maxscore) else None
+                "course_id":        COURSE_ID,
+                "cmid":             cmid,
+                "h5pactivityid":    h5p_id,
+                "h5p_name":         name,
+                "anon_user":        anonymise(uid),
+                "attemptid":        att_id,
+                "timestart":        to_datetime_str(start),
+                "timefinish":       to_datetime_str(finish),
+                "started_unix":     start,
+                "finished_unix":    finish,
+                "duration_seconds": calc_duration(start, finish),
+                "score":            score,
+                "maxscore":         max_sc,
+                "score_pct":        score_pct,
             })
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            fp = EXPORTS / f"h5p_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[h5p] Wrote {len(df)} rows → {fp.name}")
+            path = EXPORTS / f"h5p_{cmid}.csv"
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            log(f"[h5p] Wrote {len(df)} rows -> {path.name}")
         else:
             log(f"[h5p] No rows for cmid {cmid}.")
 
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            fp = EXPORTS / f"h5p_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[h5p] Wrote {len(df)} rows → {fp.name}")
-        else:
-            log(f"[h5p] No rows for cmid {cmid}.")
 
-def export_database(api: API, course_id: int, cmids: List[int], cmmap: Dict[int, Dict[str, Any]], salt: str):
+def export_databases(cmids, modules):
     if not cmids:
-        log("[data] None configured — skipping.")
+        log("[data] No database CMIDs configured — skipping.")
         return
 
-    # Only CMIDs that are actually Database activities (mod_data)
-    data_cmids_only = [c for c in cmids if cmmap.get(c, {}).get("modname") == "data"]
-    if not data_cmids_only:
-        log("[data] No 'Database' (mod_data) CMIDs to export — skipping.")
+    data_cmids = [c for c in cmids if modules.get(c, {}).get("modname") == "data"]
+    if not data_cmids:
+        log("[data] No 'Database' (mod_data) CMIDs found — skipping.")
         return
 
-    # Map instance id -> cmid for the requested Database activities
-    inst2cm = {}
-    for cmid in data_cmids_only:
-        meta = cmmap.get(cmid, {})
-        inst = meta.get("instance")
-        if inst is not None:
-            inst2cm[int(inst)] = cmid
+    instance_to_cmid = {}
+    for cmid in data_cmids:
+        instance = modules[cmid].get("instance")
+        if instance:
+            instance_to_cmid[int(instance)] = cmid
 
-    # --- Fetch databases (handle dict or list shapes) ---
     try:
-        resp = api.call("mod_data_get_databases_by_courses", courseids=[course_id])
+        result = call_moodle("mod_data_get_databases_by_courses", courseids=[COURSE_ID])
     except Exception as e:
         log(f"[data] mod_data_get_databases_by_courses not available: {e}")
         return
 
-    if isinstance(resp, dict):
-        if "databases" in resp and isinstance(resp["databases"], list):
-            databases = resp["databases"]
-        elif "courses" in resp and isinstance(resp["courses"], list):
-            # Some versions nest per-course
-            databases = []
-            for c in resp["courses"]:
-                dbs = c.get("databases") or c.get("instances") or []
-                if isinstance(dbs, list):
-                    databases.extend(dbs)
-        else:
-            # Fallback: collect any list-of-dicts values
-            databases = []
-            for v in resp.values():
-                if isinstance(v, list):
-                    databases.extend([x for x in v if isinstance(x, dict) and "id" in x])
-    elif isinstance(resp, list):
-        databases = resp
+    if isinstance(result, dict) and "databases" in result:
+        db_list = result["databases"]
+    elif isinstance(result, list):
+        db_list = result
     else:
-        databases = []
+        db_list = []
 
-    if not databases:
-        log("[data] No databases returned by the API — skipping.")
-        return
-
-    for d in databases:
+    for db in db_list:
         try:
-            did = int(d.get("id"))
+            db_id = int(db["id"])
         except Exception:
             continue
 
-        cmid = inst2cm.get(did)
+        cmid = instance_to_cmid.get(db_id)
         if not cmid:
-            # This database instance isn't one of the requested CMIDs
             continue
 
-        dname = d.get("name")
-        log(f"[data] Exporting '{dname}' (databaseid={did}, cmid={cmid})")
+        name = db.get("name")
+        log(f"[data] Exporting '{name}' (databaseid={db_id}, cmid={cmid})")
 
-        # Entries (shape-proof)
         try:
-            eresp = api.call("mod_data_get_entries", databaseid=did)
-            if isinstance(eresp, dict) and "entries" in eresp:
-                entries = eresp["entries"] or []
-            elif isinstance(eresp, list):
-                entries = eresp
-            else:
-                entries = []
+            entries_result = call_moodle("mod_data_get_entries", databaseid=db_id)
+            entries = entries_result.get("entries", []) if isinstance(entries_result, dict) else []
         except Exception as e:
-            log(f"[data] entries failed: {e}")
+            log(f"[data] Could not get entries: {e}")
             entries = []
 
-        rows: List[Dict[str, Any]] = []
-        for e in entries:
-            uid = e.get("userid")
-            created = e.get("timecreated")
+        rows = []
+        for entry in entries:
+            uid     = entry.get("userid")
+            created = entry.get("timecreated")
             rows.append({
-                "course_id": course_id,
-                "cmid": cmid,
-                "databaseid": did,
-                "database_name": dname,
-                "entryid": e.get("id"),
-                "anon_user": anon_user(uid, salt) if uid is not None else None,
-                "created_unix": created,
-                "created_at": to_iso(created),
-                "approved": e.get("approved"),
+                "course_id":     COURSE_ID,
+                "cmid":          cmid,
+                "databaseid":    db_id,
+                "database_name": name,
+                "entryid":       entry.get("id"),
+                "anon_user":     anonymise(uid),
+                "created_unix":  created,
+                "created_at":    to_datetime_str(created),
+                "approved":      entry.get("approved"),
             })
 
         df = pd.DataFrame(rows)
         if not df.empty:
-            fp = EXPORTS / f"data_{cmid}.csv"
-            write_csv(df, fp)
-            log(f"[data] Wrote {len(df)} rows → {fp.name}")
+            path = EXPORTS / f"data_{cmid}.csv"
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            log(f"[data] Wrote {len(df)} rows -> {path.name}")
         else:
             log(f"[data] No rows for cmid {cmid}.")
 
 
-def export_forums(api: API, course_id: int, cmids: List[int], cmmap: Dict[int, Dict[str, Any]], salt: str):
-    """Optional: requires forum WS functions in your external service."""
+def export_forums(cmids, modules):
     if not cmids:
         log("[forum] None configured — skipping.")
         return
-    inst2cm = {meta["instance"]: cmid for cmid, meta in cmmap.items() if meta.get("modname") == "forum"}
+
+    # Map forum instance ID -> CMID
+    instance_to_cmid = {}
+    for cmid, mod in modules.items():
+        if mod.get("modname") == "forum":
+            instance_to_cmid[mod["instance"]] = cmid
+
     try:
-        forums = api.call("mod_forum_get_forums_by_courses", courseids=[course_id])
+        forums = call_moodle("mod_forum_get_forums_by_courses", courseids=[COURSE_ID])
     except Exception as e:
         log(f"[forum] Forum endpoints not available: {e}")
         return
 
-    for f in forums:
-        fid = int(f.get("id"))
-        cmid = inst2cm.get(fid)
+    for forum in forums:
+        forum_id = int(forum["id"])
+        cmid     = instance_to_cmid.get(forum_id)
         if cmid not in cmids:
             continue
-        fname = f.get("name")
-        log(f"[forum] Exporting '{fname}' (forumid={fid}, cmid={cmid})")
 
-        # Discussions
+        name = forum.get("name")
+        log(f"[forum] Exporting '{name}' (forumid={forum_id}, cmid={cmid})")
+
         try:
-            discussions = api.call("mod_forum_get_forum_discussions", forumid=fid)
-            if isinstance(discussions, dict) and "discussions" in discussions:
-                discussions = discussions["discussions"]
-        except Exception:
-            # fallback to paginated
+            disc_result  = call_moodle("mod_forum_get_forum_discussions", forumid=forum_id)
+            discussions  = disc_result.get("discussions", []) if isinstance(disc_result, dict) else disc_result or []
+        except Exception as e:
+            log(f"  Could not get discussions: {e}")
+            continue
+
+        rows = []
+        for discussion in discussions:
+            disc_id = discussion.get("discussion") or discussion.get("id")
             try:
-                d2 = api.call("mod_forum_get_forum_discussions_paginated", forumid=fid, page=0, perpage=1000)
-                discussions = d2.get("discussions", [])
-            except Exception as e2:
-                log(f"   ! could not fetch discussions: {e2}")
+                post_result = call_moodle("mod_forum_get_discussion_posts", discussionid=disc_id)
+                posts       = post_result.get("posts", []) if isinstance(post_result, dict) else post_result or []
+            except Exception as e:
+                log(f"  Could not get posts for discussion {disc_id}: {e}")
                 continue
 
-        posts_rows: List[Dict[str, Any]] = []
-        for d in discussions or []:
-            did = d.get("discussion") or d.get("id")
-            try:
-                posts = api.call("mod_forum_get_discussion_posts", discussionid=did)
-                if isinstance(posts, dict) and "posts" in posts:
-                    posts = posts["posts"]
-            except Exception as e:
-                log(f"   ! posts failed for discussion {did}: {e}")
-                continue
-            for p in posts or []:
-                uid = p.get("userid") or (p.get("author") or {}).get("id")
-                created = p.get("timecreated")
-                posts_rows.append({
-                    "course_id": course_id,
-                    "cmid": cmid,
-                    "forumid": fid,
-                    "forum_name": fname,
-                    "discussionid": did,
-                    "postid": p.get("id"),
-                    "parentid": p.get("parent"),
-                    "anon_user": anon_user(uid, salt) if uid is not None else None,
+            for post in posts:
+                uid     = post.get("userid") or (post.get("author") or {}).get("id")
+                created = post.get("timecreated")
+                rows.append({
+                    "course_id":    COURSE_ID,
+                    "cmid":         cmid,
+                    "forumid":      forum_id,
+                    "forum_name":   name,
+                    "discussionid": disc_id,
+                    "postid":       post.get("id"),
+                    "parentid":     post.get("parent"),
+                    "anon_user":    anonymise(uid),
                     "created_unix": created,
-                    "created_at": to_iso(created),
-                    "subject": p.get("subject"),
+                    "created_at":   to_datetime_str(created),
+                    "subject":      post.get("subject"),
                 })
 
-        df = pd.DataFrame(posts_rows)
+        df = pd.DataFrame(rows)
         if not df.empty:
-            fp = EXPORTS / f"forum_{cmid}_posts.csv"
-            write_csv(df, fp)
-            log(f"[forum] Wrote {len(df)} rows → {fp.name}")
-            # simple summary
-            summary = df.groupby("anon_user", dropna=True)["postid"].count().reset_index(name="posts")
-            write_csv(summary, EXPORTS / f"forum_{cmid}_summary.csv")
+            path = EXPORTS / f"forum_{cmid}_posts.csv"
+            df.to_csv(path, index=False, encoding="utf-8-sig")
+            log(f"[forum] Wrote {len(df)} rows -> {path.name}")
+            # Save a simple summary: posts per anonymised user
+            summary = df.groupby("anon_user")["postid"].count().reset_index(name="posts")
+            summary.to_csv(EXPORTS / f"forum_{cmid}_summary.csv", index=False, encoding="utf-8-sig")
         else:
             log(f"[forum] No posts for cmid {cmid}.")
 
-# ----------------- Main -----------------
 
-def main():
-    load_dotenv()
-    base = os.getenv("MOODLE_BASE_URL")
-    token = os.getenv("MOODLE_WSTOKEN")
-    salt = os.getenv("HASH_SALT", "anonymous")
-    try:
-        course_id = int(os.getenv("COURSE_ID", "0"))
-    except ValueError:
-        print("COURSE_ID must be an integer.", file=sys.stderr); sys.exit(1)
+# ── Main entry point ──────────────────────────────────────────────────────────
 
-    quiz_cmids   = parse_ids(os.getenv("QUIZ_CMIDS", ""))
-    assign_cmids = parse_ids(os.getenv("ASSIGN_CMIDS", ""))
-    forum_cmids  = parse_ids(os.getenv("FORUM_CMIDS", ""))
-    h5p_cmids    = parse_ids(os.getenv("HVP_CMIDS", ""))
-    data_cmids   = parse_ids(os.getenv("DATA_CMIDS", ""))
+if __name__ == "__main__":
+    if not MOODLE_URL or not TOKEN or not COURSE_ID:
+        print("Error: Please set MOODLE_BASE_URL, MOODLE_WSTOKEN, and COURSE_ID in your .env file.")
+        sys.exit(1)
 
-    if not base or not token or not course_id:
-        print("Please set MOODLE_BASE_URL, MOODLE_WSTOKEN, COURSE_ID in .env", file=sys.stderr); sys.exit(1)
+    quiz_cmids   = parse_cmids(os.getenv("QUIZ_CMIDS",   ""))
+    assign_cmids = parse_cmids(os.getenv("ASSIGN_CMIDS", ""))
+    forum_cmids  = parse_cmids(os.getenv("FORUM_CMIDS",  ""))
+    h5p_cmids    = parse_cmids(os.getenv("HVP_CMIDS",    ""))
+    data_cmids   = parse_cmids(os.getenv("DATA_CMIDS",   ""))
 
     reset_output()
     log("Export started.")
 
-    api = API(base, token)
-    # quick token sanity:
-    site = api.call("core_webservice_get_site_info")
-    log(f"Connected to {site.get('sitename')} as user id {site.get('userid')}")
+    # Check the connection and confirm which Moodle site we are on
+    site_info = call_moodle("core_webservice_get_site_info")
+    log(f"Connected to Moodle {site_info.get('sitename')} as user id {site_info.get('userid')}")
 
-    cmmap = discover_modules(api, course_id)
-    log(f"Discovered {len(cmmap)} modules in course {course_id}.")
+    modules = get_modules()
+    log(f"Discovered {len(modules)} modules in course {COURSE_ID}.")
 
-    # Do exports
-    export_quizzes(api, course_id, quiz_cmids, cmmap, salt)
-    export_assignments(api, course_id, assign_cmids, cmmap, salt)
-    export_h5p(api, course_id, h5p_cmids, cmmap, salt)
-    export_database(api, course_id, data_cmids, cmmap, salt)
-    export_forums(api, course_id, forum_cmids, cmmap, salt)
+    export_quizzes(quiz_cmids, modules)
+    export_assignments(assign_cmids, modules)
+    export_h5p(h5p_cmids, modules)
+    export_databases(data_cmids, modules)
+    export_forums(forum_cmids, modules)
 
     log("Export done. Check the 'output/exports' folder.")
-
-if __name__ == "__main__":
-    main()

@@ -1,8 +1,8 @@
-# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+# Secrets - never commit
 .env
 *.env.local
 
-# ── Python environment ────────────────────────────────────────────────────────
+# Python environment
 .venv/
 venv/
 env/
@@ -14,11 +14,11 @@ __pycache__/
 dist/
 build/
 
-# ── Generated outputs (run the scripts to reproduce) ─────────────────────────
+# Generated outputs
 output/
 exports/
 
-# ── OS / editor junk ─────────────────────────────────────────────────────────
+# OS and editor files
 ~$*
 *.tmp
 .DS_Store
