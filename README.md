@@ -38,7 +38,7 @@ Course_1516_Python_Script/
   README.md              Project explanation and setup guide
 ```
 
-Generated files are written to the `output/` folder. This folder is ignored by Git because it can contain exported course data and can be recreated by running the scripts.
+Generated CSV files and charts are written to the `output/` folder. The repository includes the current anonymised output results as evidence of the analysis. Runtime logs and temporary export files are still ignored.
 
 ## Important Security Note
 
@@ -179,7 +179,7 @@ The analysis can create outputs such as:
 - forum participation charts
 - summary CSV files for all activity types
 
-The generated output is not committed to Git.
+The current anonymised generated output is included in Git. Runtime logs and temporary export files are not included.
 
 ## GDPR and Privacy Approach
 
