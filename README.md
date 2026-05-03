@@ -1,6 +1,6 @@
 # Data Mining with GDPR Compliance in E-Learning
 
-This repository contains the Python code for a thesis project about privacy-aware data mining in Moodle e-learning courses.
+This repository contains the Python code for a project about privacy-aware data mining in Moodle e-learning courses.
 
 The project collects learning activity data from Moodle, removes direct user identity by replacing user IDs with salted SHA-256 hash values, and creates CSV summaries and charts for learning analytics.
 
