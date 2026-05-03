@@ -1,0 +1,27 @@
+# ── Secrets — NEVER commit ────────────────────────────────────────────────────
+.env
+*.env.local
+
+# ── Python environment ────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# ── Generated outputs (run the scripts to reproduce) ─────────────────────────
+output/
+exports/
+
+# ── OS / editor junk ─────────────────────────────────────────────────────────
+~$*
+*.tmp
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
