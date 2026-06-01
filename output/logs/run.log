@@ -1,0 +1,34 @@
+[2026-06-01T16:42:49] ======================================================================
+[2026-06-01T16:42:49] MOODLE EXPORT STARTED
+[2026-06-01T16:42:49] ======================================================================
+[2026-06-01T16:42:49] ✓ Connected to: Moodle FH Dortmund
+[2026-06-01T16:42:49]   User: arthisararaj.new (ID: 637)
+[2026-06-01T16:42:50] ✓ Found 41 modules in course 1516
+[2026-06-01T16:42:50] 
+[2026-06-01T16:42:50] Starting exports...
+[2026-06-01T16:42:51] [quiz] Exporting 'Navigation Scavenger Quiz'
+[2026-06-01T16:42:54]   → Saved 5 rows to quiz_2641.csv
+[2026-06-01T16:42:54] [quiz] Exporting 'Interactive Tools Knowledge Check'
+[2026-06-01T16:42:58]   → Saved 6 rows to quiz_2657.csv
+[2026-06-01T16:42:59] [assign] Exporting 'Explore Examples of All Resource Types in Moodle'
+[2026-06-01T16:42:59]   → Saved 1 rows to assign_2652.csv
+[2026-06-01T16:42:59] [assign] Exporting 'Hands-On Practice: Create Interactive Activities'
+[2026-06-01T16:43:00]   → Saved 1 rows to assign_2659.csv
+[2026-06-01T16:43:00] [assign] Exporting 'Mini-Course Project: Add Interactive Activities'
+[2026-06-01T16:43:00]   → Saved 1 rows to assign_2660.csv
+[2026-06-01T16:43:00] [assign] Exporting 'Participant Management Task (Individual)'
+[2026-06-01T16:43:00]   → Saved 1 rows to assign_2664.csv
+[2026-06-01T16:43:00] [assign] Exporting 'Turnitin Setup Challenge (Group Activity)'
+[2026-06-01T16:43:01]   → Saved 1 rows to assign_2665.csv
+[2026-06-01T16:43:01] [assign] Exporting 'Participant Management Submission'
+[2026-06-01T16:43:01]   → Saved 2 rows to assign_2667.csv
+[2026-06-01T16:43:01] [assign] Exporting 'Finalisation of the Mini-Course - Duration:1 week'
+[2026-06-01T16:43:02]   → Saved 1 rows to assign_2673.csv
+[2026-06-01T16:43:02] [h5p] No CMIDs configured — skipping.
+[2026-06-01T16:43:02] [data] No CMIDs configured — skipping.
+[2026-06-01T16:43:02] [forum] No CMIDs configured — skipping.
+[2026-06-01T16:43:02] 
+[2026-06-01T16:43:02] ======================================================================
+[2026-06-01T16:43:02] ✓ EXPORT COMPLETED
+[2026-06-01T16:43:02]   Data saved to: c:\Users\arthi\OneDrive\Desktop\Codes\7216696_Project_Thesis_Complete_Work\Course_1516_Python_Script\output\exports
+[2026-06-01T16:43:02] ======================================================================
